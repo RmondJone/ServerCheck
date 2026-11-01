@@ -35,7 +35,7 @@
 
 | 模块名称 | 检测项与能力说明 | 风险等级 |
 | :--- | :--- | :--- |
-| **暴力破解与登录审计** (`bruteforce`) | • 分析 `/var/log/auth.log`、`/var/log/secure` 及 `journalctl`<br>• 统计 SSH 暴力破解总次数、Top 10 恶意攻击源 IP、受针对探测账号<br>• 审计当前在线活跃会话 (`who` / `w`)<br>• 审计最近登录历史与异常公网 IP 登录 (`last` / `lastb`) | HIGH / MEDIUM |
+| **多服务暴力破解与登录审计** (`bruteforce`) | • **SSH 登录双向审计**：默认必显 SSH 最近登录成功报告（公网 IP 预警）与 SSH 失败流水报告<br>• **SSH 暴力破解排查**：统计爆破总次数、Top 攻击源 IP、受针对探测账号及最近事件流水<br>• **数据库爆破排查**：分析 MySQL / MariaDB 错误日志中的 `Access denied` 认证爆破<br>• **缓存未授权排查**：分析 Redis 日志中的认证爆破与未授权探测<br>• **Web 登录与扫描排查**：分析 Nginx / Apache 访问日志，检测针对后台的 POST 撞库与高频 404/403 敏感路径爬行扫描<br>• **FTP 暴力破解排查**：分析 vsftpd / proftpd / pure-ftpd 登录失败记录<br>• **在线会话审计**：审计当前在线活跃终端 (`who` / `w`) 与未授权公网登录 | HIGH / MEDIUM |
 | **系统账号与后门账户** (`account`) | • 检查 **UID 为 0 的非 root 用户**（极其隐蔽的超级管理员后门）<br>• 检查空口令用户与影子文件异常 (`/etc/shadow`)<br>• 统计具备交互式登录 Shell 的系统服务账户<br>• 审计 Sudo 免密完全提权规则 (`NOPASSWD: ALL`)<br>• 审计所有用户目录下的 SSH 授权公钥 (`~/.ssh/authorized_keys`) | CRITICAL / HIGH |
 | **恶意进程与反弹Shell** (`process`) | • 精准匹配已知挖矿木马关键词 (`xmrig`, `c3pool`, `kinsing`, `kdevtmpfsi` 等)<br>• 排查常见反弹 Shell 进程特征 (`bash -i >& /dev/tcp`, `nc -e`, `pty.spawn`)<br>• 排查在 `/tmp`, `/var/tmp`, `/dev/shm` 等可写临时目录运行的可疑进程<br>• 排查已删除原文件仍在内存中运行的隐蔽进程 (`(deleted)` 进程)<br>• 排查 CPU 持续占用 > 80% 的疑似挖矿进程 | CRITICAL / HIGH |
 | **网络连接与可疑外联** (`network`) | • 排查本地 LISTEN 监听端口，重点识别常见后门与木马端口<br>• 排查 ESTABLISHED 外部连接，检测是否外联已知矿池或 C2 服务器<br>• 检测网卡是否开启混杂模式 (`PROMISC`)，防范流量嗅探窃听 | CRITICAL / HIGH |

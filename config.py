@@ -32,6 +32,47 @@ BRUTE_FORCE_CONFIG = {
     "recent_display_limit": 15,
 }
 
+# 扩展服务爆破检测配置 (数据库、Web、缓存、文件传输等)
+SERVICES_BRUTE_FORCE_CONFIG = {
+    # 1. MySQL / MariaDB 爆破
+    "mysql_log_paths": [
+        "/var/log/mysql/error.log*",
+        "/var/log/mysqld.log*",
+        "/var/log/mariadb/mariadb.log*",
+        "/usr/local/mysql/data/*.err",
+    ],
+    "mysql_threshold": 5,
+
+    # 2. Redis 爆破与未授权
+    "redis_log_paths": [
+        "/var/log/redis/redis-server.log*",
+        "/var/log/redis/redis.log*",
+        "/var/log/redis-server.log*",
+        "/usr/local/redis/log/*.log",
+    ],
+    "redis_threshold": 5,
+
+    # 3. Web 登录爆破与敏感目录扫描 (Nginx / Apache / 宝塔)
+    "web_log_paths": [
+        "/var/log/nginx/access.log*",
+        "/var/log/nginx/*access*.log*",
+        "/var/log/apache2/access.log*",
+        "/var/log/httpd/access_log*",
+        "/www/wwwlogs/*.log",
+    ],
+    "web_login_threshold": 10,   # 单 IP 针对登录接口请求次数阈值
+    "web_scan_threshold": 20,    # 单 IP 针对敏感路径 404/403 扫描次数阈值
+
+    # 4. FTP 爆破 (vsftpd / proftpd / pure-ftpd)
+    "ftp_log_paths": [
+        "/var/log/vsftpd.log*",
+        "/var/log/xferlog*",
+        "/var/log/proftpd/proftpd.log*",
+        "/var/log/pure-ftpd/pure-ftpd.log*",
+    ],
+    "ftp_threshold": 5,
+}
+
 # 挖矿木马与恶意进程黑名单特征（精确匹配或单词边界匹配）
 MALICIOUS_PROCESS_KEYWORDS = [
     "xmrig", "c3pool", "minerd", "xmr-stak", "kworkerds",

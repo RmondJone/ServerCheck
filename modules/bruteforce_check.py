@@ -5,6 +5,10 @@
 1. 最近 SSH 登录失败与暴力破解报告 (统计概览 + 最近失败详细流水)
 2. 最近 SSH 登录成功报告 (日志 Accepted 事件与 last pts 远程会话审计 + 公网 IP 预警)
 3. 当前在线活跃登录会话审计 (who / w)
+4. MySQL / MariaDB 数据库外部暴力破解排查
+5. Redis 缓存服务外部认证爆破与未授权探测排查
+6. Web 应用后台登录爆破与敏感路径恶意扫描排查 (Nginx / Apache)
+7. FTP 服务暴力破解排查 (vsftpd / proftpd / pure-ftpd)
 """
 
 import os
@@ -15,40 +19,54 @@ from collections import Counter
 from typing import List, Tuple, Dict, Any
 from core.base import BaseModule
 from core.utils import run_cmd, read_file_safe, is_private_ip, is_root, is_darwin, is_linux
-from config import Severity, BRUTE_FORCE_CONFIG
+from config import Severity, BRUTE_FORCE_CONFIG, SERVICES_BRUTE_FORCE_CONFIG
 
 class BruteForceCheck(BaseModule):
     name = "BruteForceCheck"
-    description = "SSH 登录审计与暴力破解排查"
+    description = "多服务暴力破解与登录历史审计"
 
     def run(self):
         log_lines, has_perm_denied = self._get_log_lines()
+        
+        # 1. SSH 失败与成功登录审计 (默认必出)
         self._check_ssh_failed_logins(log_lines, has_perm_denied)
         self._check_ssh_successful_logins(log_lines, has_perm_denied)
+        
+        # 2. 当前在线用户会话
         self._check_current_users()
+
+        # 3. 常见外部应用服务爆破排查 (MySQL / Redis / Web / FTP)
+        checked_services = []
+        if self._check_mysql_bruteforce():
+            checked_services.append("MySQL")
+        if self._check_redis_bruteforce():
+            checked_services.append("Redis")
+        if self._check_web_bruteforce():
+            checked_services.append("Web(Nginx/Apache)")
+        if self._check_ftp_bruteforce():
+            checked_services.append("FTP")
+
+        # 若未检测到任何上述服务的独立日志，生成汇总审计报告
+        if not checked_services:
+            self._add_services_summary_finding()
+
         return self.findings
 
     def _extract_timestamp(self, line: str) -> str:
         """从日志行中提取时间戳，规范化输出"""
-        # ISO 8601: 2026-11-01T10:20:30... 或 2026-11-01 10:20:30...
         m_iso = re.match(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})", line)
         if m_iso:
             return m_iso.group(1).replace("T", " ")
-        # Syslog: Nov  1 10:20:30 或 Nov 01 10:20:30
         m_syslog = re.match(r"^([A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})", line)
         if m_syslog:
             return m_syslog.group(1)
         return "未知时间"
 
-    def _get_log_lines(self) -> Tuple[List[str], bool]:
-        """
-        尝试读取系统认证日志，返回 (有效日志行列表, 是否遭遇权限受限)
-        支持 Linux (auth.log/secure/journalctl) 与 macOS (system.log/log show)
-        """
+    def _get_ssh_log_lines(self) -> Tuple[List[str], bool]:
+        """尝试读取 SSH 认证日志，返回 (有效日志行列表, 是否权限受限)"""
         lines: List[str] = []
         has_perm_denied = False
 
-        # 针对 macOS 系统
         if is_darwin():
             if os.path.exists("/var/log/system.log"):
                 sys_lines = read_file_safe("/var/log/system.log", max_lines=3000)
@@ -56,14 +74,11 @@ class BruteForceCheck(BaseModule):
                 if sshd_lines:
                     lines.extend(sshd_lines)
             if not lines:
-                # 使用完整路径调用 /usr/bin/log，规避 zsh 内置 log 命令冲突
                 code, out, _ = run_cmd("/usr/bin/log show --predicate 'process == \"sshd\"' --style syslog --last 1d 2>/dev/null", timeout=6)
                 if code == 0 and out.strip():
                     lines = [l for l in out.splitlines() if l.strip() and not l.startswith("Filtering the log data") and not l.startswith("Skipping info")]
             return lines, False
 
-        # 针对 Linux 系统
-        # 1. 尝试直接从日志文件读取
         for path_pattern in BRUTE_FORCE_CONFIG.get("auth_log_paths", []):
             for file_path in glob.glob(path_pattern):
                 if os.path.exists(file_path):
@@ -82,7 +97,6 @@ class BruteForceCheck(BaseModule):
                     except Exception:
                         pass
 
-        # 2. 如果未读取到有效行或全部权限拒绝，尝试 journalctl 兜底
         if not lines:
             code, out, _ = run_cmd("journalctl -u ssh -u sshd --no-pager -n 5000 2>/dev/null", timeout=10)
             if code == 0 and out.strip():
@@ -91,31 +105,26 @@ class BruteForceCheck(BaseModule):
 
         return lines, has_perm_denied
 
+    # 兼容别名
+    _get_log_lines = _get_ssh_log_lines
+
     def _check_ssh_failed_logins(self, log_lines: List[str], has_perm_denied: bool):
-        """
-        审计最近 SSH 登录失败与暴力破解记录
-        默认必定在报告中呈现该项检测结果。
-        """
+        """审计最近 SSH 登录失败与暴力破解记录 (默认必出)"""
         failed_events: List[Dict[str, Any]] = []
         failed_ip_counter = Counter()
         target_user_counter = Counter()
 
-        # 匹配模式
-        # Pattern 1: Failed password / publickey for [invalid user] <user> from <ip> port <port>
         p_failed = re.compile(
             r"Failed\s+(password|publickey)\s+for\s+(invalid user\s+)?([^\s]+)\s+from\s+([0-9a-fA-F\.:]+)(?:\s+port\s+(\d+))?"
         )
-        # Pattern 2: Invalid user <user> from <ip> port <port>
         p_invalid = re.compile(
             r"Invalid user\s+([^\s]+)\s+from\s+([0-9a-fA-F\.:]+)(?:\s+port\s+(\d+))?"
         )
-        # Pattern 3: PAM authentication failure; ... rhost=<ip> [user=<user>]
         p_pam = re.compile(
             r"authentication failure;.*rhost=([0-9a-fA-F\.:]+)(?:.*user=([^\s]+))?"
         )
 
         seen_keys = set()
-
         for line in reversed(log_lines):
             t_str = self._extract_timestamp(line)
             m = p_failed.search(line)
@@ -129,12 +138,7 @@ class BruteForceCheck(BaseModule):
                 if key not in seen_keys:
                     seen_keys.add(key)
                     failed_events.append({
-                        "time": t_str,
-                        "user": user_label,
-                        "ip": ip,
-                        "port": port,
-                        "reason": reason,
-                        "is_external": not is_private_ip(ip)
+                        "time": t_str, "user": user_label, "ip": ip, "port": port, "reason": reason, "is_external": not is_private_ip(ip)
                     })
                 continue
 
@@ -147,12 +151,7 @@ class BruteForceCheck(BaseModule):
                 if key not in seen_keys:
                     seen_keys.add(key)
                     failed_events.append({
-                        "time": t_str,
-                        "user": f"{user} (非法用户)",
-                        "ip": ip,
-                        "port": port,
-                        "reason": "探测不存在的账号 (Invalid user)",
-                        "is_external": not is_private_ip(ip)
+                        "time": t_str, "user": f"{user} (非法用户)", "ip": ip, "port": port, "reason": "探测不存在的账号 (Invalid user)", "is_external": not is_private_ip(ip)
                     })
                 continue
 
@@ -166,16 +165,10 @@ class BruteForceCheck(BaseModule):
                 if key not in seen_keys:
                     seen_keys.add(key)
                     failed_events.append({
-                        "time": t_str,
-                        "user": user,
-                        "ip": ip,
-                        "port": "-",
-                        "reason": "PAM底层认证失败 (PAM failure)",
-                        "is_external": not is_private_ip(ip)
+                        "time": t_str, "user": user, "ip": ip, "port": "-", "reason": "PAM底层认证失败 (PAM failure)", "is_external": not is_private_ip(ip)
                     })
                 continue
 
-        # 尝试补充 lastb (btmp) 失败记录 (Linux)
         code, out, _ = run_cmd("lastb -n 30 2>/dev/null", timeout=5)
         if code == 0 and out.strip():
             for line in out.strip().splitlines():
@@ -193,12 +186,7 @@ class BruteForceCheck(BaseModule):
                             failed_ip_counter[host_or_ip] += 1
                             target_user_counter[u] += 1
                             failed_events.append({
-                                "time": time_info,
-                                "user": u,
-                                "ip": host_or_ip,
-                                "port": "-",
-                                "reason": f"登录认证失败 (lastb {tty})",
-                                "is_external": not is_private_ip(host_or_ip)
+                                "time": time_info, "user": u, "ip": host_or_ip, "port": "-", "reason": f"登录认证失败 (lastb {tty})", "is_external": not is_private_ip(host_or_ip)
                             })
 
         total_failed_attempts = sum(failed_ip_counter.values())
@@ -286,14 +274,10 @@ class BruteForceCheck(BaseModule):
                 )
 
     def _check_ssh_successful_logins(self, log_lines: List[str], has_perm_denied: bool):
-        """
-        审计最近 SSH 登录成功记录
-        默认必定在报告中呈现该项检测结果。
-        """
+        """审计最近 SSH 登录成功记录 (默认必出)"""
         successful_records: List[Dict[str, Any]] = []
         seen_keys = set()
 
-        # 1. 从系统认证日志解析 Accepted 成功事件
         p_accepted = re.compile(
             r"Accepted\s+([^\s]+)\s+for\s+(?:invalid user\s+)?([^\s]+)\s+from\s+([0-9a-fA-F\.:]+)(?:\s+port\s+(\d+))?"
         )
@@ -316,7 +300,6 @@ class BruteForceCheck(BaseModule):
                         "is_external": not is_private_ip(ip)
                     })
 
-        # 2. 从 last 命令中解析远程 SSH 成功会话 (pts 或具有远程客户端 IP 的会话) 作为有力补充
         last_limit = BRUTE_FORCE_CONFIG.get("last_login_limit", 50)
         code, out, _ = run_cmd(f"last -n {last_limit} -F 2>/dev/null || last -n {last_limit} 2>/dev/null", timeout=5)
         if code == 0 and out.strip():
@@ -330,9 +313,6 @@ class BruteForceCheck(BaseModule):
                     tty = parts[1]
                     host_or_ip = parts[2]
 
-                    # 严格判定 SSH 远程会话特征，剔除本地控制台及系统伪终端：
-                    # 1) Linux 下远程 SSH 均为 pts/X
-                    # 2) macOS 下带有远程 IPv4/IPv6 或域名的 ttys 会话
                     is_ssh_session = False
                     if tty.startswith("pts/"):
                         is_ssh_session = True
@@ -436,3 +416,329 @@ class BruteForceCheck(BaseModule):
                 description="当前系统未检测到正在登录的在线交互式终端会话。",
                 raw_evidence="当前无活跃登录终端。"
             )
+
+    # =========================================================================
+    # 扩展外部服务爆破排查：MySQL / Redis / Web / FTP
+    # =========================================================================
+
+    def _collect_files(self, patterns: List[str], max_files: int = 3) -> List[str]:
+        """收集匹配的文件列表，按修改时间降序排列"""
+        found = []
+        for pat in patterns:
+            for p in glob.glob(pat):
+                if os.path.exists(p) and os.path.isfile(p):
+                    found.append(p)
+        # 按修改时间从新到旧
+        found.sort(key=lambda x: os.path.getmtime(x) if os.path.exists(x) else 0, reverse=True)
+        return found[:max_files]
+
+    def _read_recent_lines(self, filepath: str, max_lines: int = 5000) -> List[str]:
+        """读取文件最新内容行"""
+        if filepath.endswith(".gz"):
+            try:
+                with gzip.open(filepath, "rt", encoding="utf-8", errors="replace") as f:
+                    return [line.rstrip("\r\n") for line in f][-max_lines:]
+            except Exception:
+                return []
+        return read_file_safe(filepath, max_lines=max_lines)
+
+    def _check_mysql_bruteforce(self) -> bool:
+        """排查 MySQL / MariaDB 数据库外部认证失败与爆破"""
+        files = self._collect_files(SERVICES_BRUTE_FORCE_CONFIG.get("mysql_log_paths", []))
+        if not files:
+            return False
+
+        all_lines = []
+        for f in files:
+            all_lines.extend(self._read_recent_lines(f, max_lines=4000))
+
+        # 匹配 MySQL Access denied
+        p_mysql = re.compile(r"Access denied for user '([^']+)'@'([0-9a-fA-F\.:]+)'")
+        fails = []
+        ip_counter = Counter()
+        user_counter = Counter()
+
+        for line in reversed(all_lines):
+            m = p_mysql.search(line)
+            if m:
+                u, ip = m.group(1), m.group(2)
+                t_str = self._extract_timestamp(line)
+                fails.append({"time": t_str, "user": u, "ip": ip, "is_external": not is_private_ip(ip)})
+                ip_counter[ip] += 1
+                user_counter[u] += 1
+
+        total = len(fails)
+        top_ips = ip_counter.most_common(5)
+        top_users = user_counter.most_common(5)
+
+        if total > 0:
+            if total >= 20 or (top_ips and top_ips[0][1] >= 10):
+                severity = Severity.HIGH
+                title = f"检测到 MySQL 数据库暴力破解尝试 (高危: 累计 {total} 次失败)"
+            else:
+                severity = Severity.MEDIUM
+                title = f"检测到 MySQL 数据库认证失败记录 (共 {total} 次)"
+
+            evidence_parts = [
+                f"=== MySQL 认证失败统计 ===",
+                f"累计失败次数: {total} 次 | 涉及攻击源 IP: {len(ip_counter)} 个",
+            ]
+            if top_ips:
+                evidence_parts.append("Top 攻击源 IP:")
+                for ip, cnt in top_ips:
+                    ext = "外部公网⚠️" if not is_private_ip(ip) else "内网"
+                    evidence_parts.append(f"  - {ip}: {cnt} 次 ({ext})")
+            if top_users:
+                evidence_parts.append("Top 受针对探测账号:")
+                for u, cnt in top_users:
+                    evidence_parts.append(f"  - {u}: {cnt} 次")
+
+            evidence_parts.append(f"\n=== 最近 MySQL 认证失败流水 (显示最近 10 条) ===")
+            for idx, item in enumerate(fails[:10], start=1):
+                ext = "外部公网⚠️" if item["is_external"] else "内网"
+                evidence_parts.append(f"[{idx:02d}] 时间: {item['time']} | 账号: {item['user']} | 来源: {item['ip']} ({ext})")
+
+            self.add_finding(
+                title=title,
+                severity=severity,
+                description=f"在 MySQL / MariaDB 错误日志中排查到针对数据库账号的认证失败与密码爆破尝试（共 {total} 次）。",
+                detail={"total_fails": total, "top_ips": top_ips, "top_users": top_users},
+                suggestion=(
+                    "1. 严禁 root 用户允许远程公网主机登录 (设置 host='localhost')；\n"
+                    "2. 修改 MySQL 默认 3306 端口，或配置安全组禁止 3306 暴露在 0.0.0.0 公网；\n"
+                    "3. 限制数据库账号仅允许业务 Web 服务器 IP 白名单连接。"
+                ),
+                raw_evidence="\n".join(evidence_parts)
+            )
+        else:
+            self.add_finding(
+                title="MySQL 数据库认证安全审计 (未检测到爆破尝试)",
+                severity=Severity.INFO,
+                description="已成功读取 MySQL / MariaDB 错误日志，未发现外部针对数据库账户的高频密码猜测或爆破行为。",
+                raw_evidence="MySQL 错误日志中未检测到 Access denied 认证拒绝记录。"
+            )
+        return True
+
+    def _check_redis_bruteforce(self) -> bool:
+        """排查 Redis 缓存服务外部认证失败与爆破"""
+        files = self._collect_files(SERVICES_BRUTE_FORCE_CONFIG.get("redis_log_paths", []))
+        if not files:
+            return False
+
+        all_lines = []
+        for f in files:
+            all_lines.extend(self._read_recent_lines(f, max_lines=4000))
+
+        p_redis = re.compile(r"(?:Bad password|Authentication failure) from client:\s*([0-9a-fA-F\.:]+)")
+        fails = []
+        ip_counter = Counter()
+
+        for line in reversed(all_lines):
+            m = p_redis.search(line)
+            if m:
+                raw_ip = m.group(1)
+                ip = raw_ip.split(":")[0] if ":" in raw_ip and not raw_ip.startswith("::") else raw_ip
+                t_str = self._extract_timestamp(line)
+                fails.append({"time": t_str, "ip": ip, "is_external": not is_private_ip(ip)})
+                ip_counter[ip] += 1
+
+        total = len(fails)
+        top_ips = ip_counter.most_common(5)
+
+        if total > 0:
+            severity = Severity.HIGH if total >= 10 else Severity.MEDIUM
+            title = f"检测到 Redis 缓存服务认证爆破/探测尝试 (共 {total} 次)"
+            evidence_parts = [
+                f"=== Redis 认证失败统计 ===",
+                f"累计检测到未授权/密码错误次数: {total} 次",
+            ]
+            if top_ips:
+                evidence_parts.append("Top 攻击源 IP:")
+                for ip, cnt in top_ips:
+                    ext = "外部公网⚠️" if not is_private_ip(ip) else "内网"
+                    evidence_parts.append(f"  - {ip}: {cnt} 次 ({ext})")
+
+            evidence_parts.append(f"\n=== 最近 Redis 认证失败流水 (显示最近 10 条) ===")
+            for idx, item in enumerate(fails[:10], start=1):
+                ext = "外部公网⚠️" if item["is_external"] else "内网"
+                evidence_parts.append(f"[{idx:02d}] 时间: {item['time']} | 来源: {item['ip']} ({ext}) | 结果: Bad password / Auth failure")
+
+            self.add_finding(
+                title=title,
+                severity=severity,
+                description=f"在 Redis 服务日志中检测到高频的未授权访问或密码认证错误（共 {total} 次），存在遭受外部扫描爆破风险！",
+                detail={"total_fails": total, "top_ips": top_ips},
+                suggestion=(
+                    "1. 绝不允许 Redis 监听在 0.0.0.0 (修改 redis.conf 配置 bind 127.0.0.1)；\n"
+                    "2. 开启 requirepass 配置强密码（至少 20 位随机混合字符串）；\n"
+                    "3. 禁用高危管理命令 (rename-command FLUSHALL \"\" 与 rename-command CONFIG \"\")。"
+                ),
+                raw_evidence="\n".join(evidence_parts)
+            )
+        else:
+            self.add_finding(
+                title="Redis 缓存服务认证安全审计 (未检测到爆破尝试)",
+                severity=Severity.INFO,
+                description="已成功读取 Redis 日志，未发现外部针对 Redis 认证口令的爆破尝试或认证失败记录。",
+                raw_evidence="Redis 日志中未检测到 Bad password 或未授权访问事件。"
+            )
+        return True
+
+    def _check_web_bruteforce(self) -> bool:
+        """排查 Web (Nginx / Apache) 登录爆破与高频敏感路径扫描"""
+        files = self._collect_files(SERVICES_BRUTE_FORCE_CONFIG.get("web_log_paths", []), max_files=4)
+        if not files:
+            return False
+
+        all_lines = []
+        for f in files:
+            all_lines.extend(self._read_recent_lines(f, max_lines=6000))
+
+        p_web = re.compile(r'^([0-9a-fA-F\.:]+)\s+.*?\[(.*?)\]\s+"([A-Z]+)\s+([^\s]+)\s+HTTP/[0-9\.]+"\s+(\d{3})')
+        
+        web_login_counter = Counter()
+        web_scan_counter = Counter()
+        suspicious_samples = []
+
+        login_keywords = ["login", "admin", "wp-login", "xmlrpc", "phpmyadmin", "signin", "auth", "token"]
+        scan_keywords = [".env", ".git", ".bak", ".zip", "phpmyadmin", "swagger", "actuator", "solr", "config.inc"]
+
+        for line in reversed(all_lines):
+            m = p_web.search(line)
+            if m:
+                ip, t_str, method, url, status = m.group(1), m.group(2), m.group(3), m.group(4), int(m.group(5))
+                url_lower = url.lower()
+
+                # 1. 检测登录接口高频 POST 爆破
+                if method == "POST" and any(k in url_lower for k in login_keywords):
+                    web_login_counter[ip] += 1
+                    if len(suspicious_samples) < 15:
+                        suspicious_samples.append({
+                            "type": "Web登录爆破", "ip": ip, "time": t_str, "method": method, "url": url, "status": status
+                        })
+
+                # 2. 检测敏感文件/路径 404/403 高频扫描
+                elif status in (404, 403) and any(k in url_lower for k in scan_keywords):
+                    web_scan_counter[ip] += 1
+                    if len(suspicious_samples) < 15:
+                        suspicious_samples.append({
+                            "type": "敏感文件扫描", "ip": ip, "time": t_str, "method": method, "url": url, "status": status
+                        })
+
+        login_threshold = SERVICES_BRUTE_FORCE_CONFIG.get("web_login_threshold", 10)
+        scan_threshold = SERVICES_BRUTE_FORCE_CONFIG.get("web_scan_threshold", 20)
+
+        attacker_login_ips = [ip for ip, cnt in web_login_counter.items() if cnt >= login_threshold]
+        attacker_scan_ips = [ip for ip, cnt in web_scan_counter.items() if cnt >= scan_threshold]
+
+        if attacker_login_ips or attacker_scan_ips:
+            all_attacker_ips = set(attacker_login_ips) | set(attacker_scan_ips)
+            severity = Severity.HIGH if (len(attacker_login_ips) > 0 or len(attacker_scan_ips) >= 3) else Severity.MEDIUM
+            title = f"检测到 Web 应用遭受外部登录爆破或敏感目录扫描 (涉及 {len(all_attacker_ips)} 个恶意源 IP)"
+            
+            evidence_parts = ["=== Web 外部恶意爆破与扫描统计 ==="]
+            if attacker_login_ips:
+                evidence_parts.append("高频登录爆破源 IP (Top):")
+                for ip in attacker_login_ips[:5]:
+                    evidence_parts.append(f"  - {ip}: 对登录接口发起 {web_login_counter[ip]} 次 POST 请求")
+            if attacker_scan_ips:
+                evidence_parts.append("敏感路径扫描源 IP (Top):")
+                for ip in attacker_scan_ips[:5]:
+                    evidence_parts.append(f"  - {ip}: 触发 {web_scan_counter[ip]} 次敏感路径 404/403 探测")
+
+            evidence_parts.append("\n=== 恶意请求样本采样 ===")
+            for idx, s in enumerate(suspicious_samples[:10], start=1):
+                evidence_parts.append(f"[{idx:02d}] 类型: {s['type']} | 来源: {s['ip']} | 请求: {s['method']} {s['url']} -> HTTP {s['status']}")
+
+            self.add_finding(
+                title=title,
+                severity=severity,
+                description="在 Web 服务器访问日志中捕获到外部恶意 IP 针对登录接口的高频撞库爆破，或针对系统敏感备份配置文件的目录爬行探测。",
+                detail={"login_attackers": attacker_login_ips, "scan_attackers": attacker_scan_ips},
+                suggestion=(
+                    "1. 为 Web 后台及重要登录接口开启验证码、双因子认证 (2FA) 或限制单 IP 请求速率；\n"
+                    "2. 屏蔽对敏感文件扩展名 (.env, .git, .bak, .sql) 的访问 (配置 Nginx location 规则直接返回 403)；\n"
+                    "3. 部署 Web 应用防火墙 (WAF) 或使用 Fail2ban 自动阻断高频探测 IP。"
+                ),
+                raw_evidence="\n".join(evidence_parts)
+            )
+        else:
+            self.add_finding(
+                title="Web 访问安全审计 (未发现高频登录爆破与目录扫描)",
+                severity=Severity.INFO,
+                description="已成功读取 Web 访问日志，未发现超出告警阈值的针对登录后台的自动化爆破或敏感路径集中扫描行为。",
+                raw_evidence="Web 访问日志中登录请求与敏感文件探测频次在正常水位以下。"
+            )
+        return True
+
+    def _check_ftp_bruteforce(self) -> bool:
+        """排查 FTP 服务暴力破解"""
+        files = self._collect_files(SERVICES_BRUTE_FORCE_CONFIG.get("ftp_log_paths", []))
+        if not files:
+            return False
+
+        all_lines = []
+        for f in files:
+            all_lines.extend(self._read_recent_lines(f, max_lines=4000))
+
+        p_ftp1 = re.compile(r'FAIL LOGIN:\s+Client\s+"([0-9a-fA-F\.:]+)"')
+        p_ftp2 = re.compile(r"USER\s+([^\s]+).*?530\s+Login incorrect")
+        fails = []
+        ip_counter = Counter()
+
+        for line in reversed(all_lines):
+            m1 = p_ftp1.search(line)
+            if m1:
+                ip = m1.group(1)
+                t_str = self._extract_timestamp(line)
+                fails.append({"time": t_str, "ip": ip, "reason": "FAIL LOGIN"})
+                ip_counter[ip] += 1
+                continue
+            m2 = p_ftp2.search(line)
+            if m2:
+                u = m2.group(1)
+                t_str = self._extract_timestamp(line)
+                fails.append({"time": t_str, "ip": "未知IP", "reason": f"User {u} Login incorrect"})
+
+        total = len(fails)
+        if total > 0:
+            severity = Severity.HIGH if total >= 10 else Severity.MEDIUM
+            title = f"检测到 FTP 服务暴力破解尝试 (共 {total} 次)"
+            evidence_parts = [
+                f"=== FTP 认证失败统计 ===",
+                f"累计检测到 FTP 登录失败次数: {total} 次",
+            ]
+            for ip, cnt in ip_counter.most_common(5):
+                ext = "外部公网⚠️" if not is_private_ip(ip) else "内网"
+                evidence_parts.append(f"  - {ip}: {cnt} 次 ({ext})")
+
+            self.add_finding(
+                title=title,
+                severity=severity,
+                description=f"在 FTP 服务日志中检测到针对 FTP 账户的高频密码猜测或暴力破解（共 {total} 次）。",
+                detail={"total_fails": total, "top_ips": ip_counter.most_common(5)},
+                suggestion=(
+                    "1. 禁用 FTP 匿名访问功能 (anonymous_enable=NO)；\n"
+                    "2. 若非必须，建议停用老旧明文 FTP 协议，改用更安全的 SFTP；\n"
+                    "3. 限制 FTP 服务的远程访问 IP。"
+                ),
+                raw_evidence="\n".join(evidence_parts)
+            )
+        else:
+            self.add_finding(
+                title="FTP 服务认证安全审计 (未检测到爆破尝试)",
+                severity=Severity.INFO,
+                description="已成功读取 FTP 日志，未发现针对 FTP 服务账户的口令爆破尝试。",
+                raw_evidence="FTP 日志中未检测到登录失败记录。"
+            )
+        return True
+
+    def _add_services_summary_finding(self):
+        """若系统未部署独立 MySQL/Redis/Web/FTP 日志，给出覆盖排查汇总说明"""
+        self.add_finding(
+            title="应用服务爆破排查总览 (MySQL/Redis/Web/FTP)",
+            severity=Severity.INFO,
+            description="已自动检索系统日志候选路径，当前未检测到独立的 MySQL、Redis、Web(Nginx/Apache) 或 FTP 服务日志（当前系统可能未安装上述服务或使用容器化独立运行），未发现本地服务被爆破痕迹。",
+            suggestion="如本地确实运行了上述服务，建议检查相关服务日志路径配置并确保启用了访问/错误日志记录。",
+            raw_evidence="未检索到活跃的 MySQL / Redis / Web / FTP 本地日志文件。"
+        )
