@@ -8,6 +8,7 @@ import sys
 import subprocess
 import platform
 import re
+import ipaddress
 from typing import Tuple, List, Optional, Dict
 
 class Colors:
@@ -135,19 +136,25 @@ def read_file_safe(path: str, max_lines: Optional[int] = None) -> List[str]:
     return lines
 
 def is_private_ip(ip: str) -> bool:
-    """判断是否为内网/本地保留 IP"""
-    if not ip or ip in ("127.0.0.1", "::1", "0.0.0.0", "*"):
+    """判断是否为内网/本地私有/保留 IP，支持 IPv4 与 IPv6"""
+    if not ip or ip in ("127.0.0.1", "::1", "0.0.0.0", "*", "localhost"):
         return True
-    # 简易正则判断
-    # 10.0.0.0/8
-    # 172.16.0.0/12
-    # 192.168.0.0/16
-    if ip.startswith("10.") or ip.startswith("192.168."):
+    clean_ip = ip.strip("[]")
+    if clean_ip.startswith("::ffff:"):
+        clean_ip = clean_ip[7:]
+    try:
+        ip_obj = ipaddress.ip_address(clean_ip)
+        return (
+            ip_obj.is_loopback or 
+            ip_obj.is_link_local or 
+            (isinstance(ip_obj, ipaddress.IPv4Address) and (
+                ip_obj in ipaddress.IPv4Network("10.0.0.0/8") or
+                ip_obj in ipaddress.IPv4Network("172.16.0.0/12") or
+                ip_obj in ipaddress.IPv4Network("192.168.0.0/16")
+            )) or
+            (isinstance(ip_obj, ipaddress.IPv6Address) and (
+                ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+            ))
+        )
+    except ValueError:
         return True
-    if ip.startswith("172."):
-        parts = ip.split(".")
-        if len(parts) >= 2 and parts[1].isdigit():
-            val = int(parts[1])
-            if 16 <= val <= 31:
-                return True
-    return False

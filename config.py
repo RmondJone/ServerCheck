@@ -28,6 +28,8 @@ BRUTE_FORCE_CONFIG = {
     ],
     # 检查最近多少条登录记录
     "last_login_limit": 50,
+    # 报告中展示最近流水条数
+    "recent_display_limit": 15,
 }
 
 # 挖矿木马与恶意进程黑名单特征（精确匹配或单词边界匹配）
