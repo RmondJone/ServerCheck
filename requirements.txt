@@ -1,0 +1,3 @@
+# 本工具采用纯 Python 3 原生标准库实现，开箱即用，无需通过 pip 安装任何第三方依赖！
+# 兼容环境：Python 3.6+
+# 运行方式：直接运行 sudo ./run.sh 或 sudo python3 main.py 即可。
