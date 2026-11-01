@@ -14,7 +14,7 @@ import glob
 import gzip
 from collections import Counter
 from core.base import BaseModule
-from core.utils import run_cmd, read_file_safe, is_private_ip
+from core.utils import run_cmd, read_file_safe, is_private_ip, is_root, is_darwin, is_linux
 from config import Severity, BRUTE_FORCE_CONFIG
 
 class BruteForceCheck(BaseModule):
@@ -29,27 +29,40 @@ class BruteForceCheck(BaseModule):
         return self.findings
 
     def _get_log_lines(self):
-        """尝试读取系统认证日志，支持 auth.log, secure, gzip压缩包或 journalctl"""
+        """尝试读取系统认证日志，支持 Linux (auth.log/secure/journalctl) 与 macOS (system.log/log show)"""
         lines = []
-        found_file = False
-        
+
+        # 针对 macOS 系统
+        if is_darwin():
+            if os.path.exists("/var/log/system.log"):
+                sys_lines = read_file_safe("/var/log/system.log", max_lines=3000)
+                sshd_lines = [l for l in sys_lines if "sshd" in l]
+                if sshd_lines:
+                    lines.extend(sshd_lines)
+            if not lines:
+                code, out, _ = run_cmd("log show --predicate 'process == \"sshd\"' --style syslog --last 1d 2>/dev/null", timeout=6)
+                if code == 0 and out.strip():
+                    lines = [l for l in out.splitlines() if l.strip() and not l.startswith("Filtering the log data")]
+            return lines
+
+        # 针对 Linux 系统
         # 1. 尝试直接从日志文件读取
         for path_pattern in BRUTE_FORCE_CONFIG["auth_log_paths"]:
             for file_path in glob.glob(path_pattern):
                 if os.path.exists(file_path):
-                    found_file = True
                     try:
                         if file_path.endswith(".gz"):
                             with gzip.open(file_path, "rt", encoding="utf-8", errors="replace") as f:
                                 lines.extend(f.readlines())
                         else:
-                            lines.extend(read_file_safe(file_path))
+                            content = read_file_safe(file_path)
+                            lines.extend(content)
                     except Exception:
                         pass
         
         # 2. 如果没有找到日志文件，或者读取为空，尝试使用 journalctl
         if not lines:
-            code, out, _ = run_cmd("journalctl -u ssh -u sshd --no-pager -n 5000", timeout=10)
+            code, out, _ = run_cmd("journalctl -u ssh -u sshd --no-pager -n 5000 2>/dev/null", timeout=10)
             if code == 0 and out:
                 lines = out.splitlines()
                 
@@ -58,14 +71,33 @@ class BruteForceCheck(BaseModule):
     def _check_ssh_bruteforce(self):
         """分析认证日志中的暴力破解行为"""
         lines = self._get_log_lines()
-        if not lines:
-            self.add_finding(
-                title="未检测到 SSH 认证日志",
-                severity=Severity.INFO,
-                description="未在默认路径 (/var/log/auth.log, /var/log/secure) 或 journalctl 中找到认证日志，可能权限不足或系统日志服务已重构。",
-                suggestion="请确保以 root 权限运行脚本，以获得读取系统安全日志的权限。"
-            )
+        # 过滤权限拒绝行
+        valid_lines = [l for l in lines if not l.startswith("[Permission Denied]")]
+        has_permission_denied = any(l.startswith("[Permission Denied]") for l in lines)
+
+        if not valid_lines:
+            if is_darwin():
+                self.add_finding(
+                    title="未检测到 SSH 认证日志 (当前系统: macOS)",
+                    severity=Severity.INFO,
+                    description="macOS 未在系统日志或 Unified Log 中检测到 sshd 相关记录（系统可能未开启远程登录 SSH 服务或近期无认证事件）。"
+                )
+            elif not is_root() or has_permission_denied:
+                self.add_finding(
+                    title="权限不足，无法读取系统认证日志",
+                    severity=Severity.INFO,
+                    description="未在默认路径 (/var/log/auth.log, /var/log/secure) 或 journalctl 中读取到认证日志。当前为普通用户运行，日志读取权限受限。",
+                    suggestion="请使用 sudo 重新运行脚本以获取系统安全日志读取权限。"
+                )
+            else:
+                self.add_finding(
+                    title="未检测到 SSH 认证日志",
+                    severity=Severity.INFO,
+                    description="当前已为 root 权限，但在默认路径 (/var/log/auth.log, /var/log/secure) 及 journalctl 中未找到 SSH 认证日志（可能未启用 SSH 服务或系统日志服务已重构）。"
+                )
             return
+
+        lines = valid_lines
 
         failed_ip_counter = Counter()
         target_user_counter = Counter()

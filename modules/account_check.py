@@ -11,8 +11,9 @@
 
 import os
 import glob
+import re
 from core.base import BaseModule
-from core.utils import run_cmd, read_file_safe
+from core.utils import run_cmd, read_file_safe, is_root, is_darwin
 from config import Severity
 
 class AccountCheck(BaseModule):
@@ -59,14 +60,38 @@ class AccountCheck(BaseModule):
 
     def _check_empty_passwords(self):
         """检查是否存在空口令账号"""
-        shadow_lines = read_file_safe("/etc/shadow")
-        if not shadow_lines or (shadow_lines and "Permission Denied" in shadow_lines[0]):
+        if is_darwin():
             self.add_finding(
-                title="无法直接读取 /etc/shadow",
+                title="当前系统 (macOS) 无 /etc/shadow 文件",
                 severity=Severity.INFO,
-                description="读取 /etc/shadow 需要超级管理员权限（root）。如果是普通用户运行，空口令检测将被跳过。",
-                suggestion="请使用 sudo 重新运行脚本以获取完整审计能力。"
+                description="macOS 采用 OpenDirectory 框架管理账户与凭据，不使用 /etc/shadow 文件，已自动跳过 Shadow 文本审计。"
             )
+            return
+
+        shadow_path = "/etc/shadow"
+        if not os.path.exists(shadow_path):
+            self.add_finding(
+                title="系统未检测到 /etc/shadow 文件",
+                severity=Severity.INFO,
+                description="系统中不存在 /etc/shadow 文件，可能采用网络目录认证 (LDAP/AD/PAM) 或非传统 Linux 发行版。"
+            )
+            return
+
+        shadow_lines = read_file_safe(shadow_path)
+        if not shadow_lines or (shadow_lines and "Permission Denied" in shadow_lines[0]):
+            if not is_root():
+                self.add_finding(
+                    title="权限不足，无法读取 /etc/shadow",
+                    severity=Severity.INFO,
+                    description="读取 /etc/shadow 需要超级管理员权限（root）。当前为普通用户运行，空口令检测已跳过。",
+                    suggestion="请使用 sudo 重新运行脚本以获取完整审计能力。"
+                )
+            else:
+                self.add_finding(
+                    title="无法读取 /etc/shadow",
+                    severity=Severity.INFO,
+                    description="当前已为 root 权限，但读取 /etc/shadow 失败，可能受 SELinux/AppArmor 等访问控制模块限制。"
+                )
             return
 
         empty_pass_users = []
@@ -89,6 +114,12 @@ class AccountCheck(BaseModule):
                 detail={"empty_password_accounts": empty_pass_users},
                 suggestion="立即为这些账户设置强密码（`passwd <username>`）或者锁定账户（`passwd -l <username>`）。",
                 raw_evidence="Empty password found for: " + ", ".join(empty_pass_users)
+            )
+        else:
+            self.add_finding(
+                title="/etc/shadow 口令状态审计正常",
+                severity=Severity.INFO,
+                description="已成功审计 /etc/shadow，未发现空口令账户。"
             )
 
     def _check_loginable_users(self):
@@ -143,23 +174,39 @@ class AccountCheck(BaseModule):
                 clean_l = line.strip()
                 if not clean_l or clean_l.startswith("#"):
                     continue
-                # 检查是否存在 ALL=(ALL) NOPASSWD: ALL 或类似无密码提权规则
-                if "NOPASSWD" in clean_l and "ALL" in clean_l:
-                    dangerous_rules.append({"file": fpath, "rule": clean_l})
+                # 检查是否存在针对所有命令的免密完全提权 (NOPASSWD: ALL)
+                # 需区分限制在特定二进制命令的免密白名单（例如: ALL ALL=(ALL) NOPASSWD: /usr/local/bin/helper）
+                if "NOPASSWD:" in clean_l:
+                    cmd_part = clean_l.split("NOPASSWD:", 1)[1].strip()
+                    cmds = [c.strip() for c in cmd_part.split(",")]
+                    # 匹配命令列表中直接为 ALL 或以 ALL 结尾通配任意命令的危险规则
+                    if any(re.search(r"^\s*ALL\b", c) for c in cmds):
+                        dangerous_rules.append({"file": fpath, "rule": clean_l})
 
         if dangerous_rules:
             self.add_finding(
-                title="发现免密 Sudo 提权配置 (NOPASSWD)",
+                title="发现免密完全 Sudo 提权配置 (NOPASSWD: ALL)",
                 severity=Severity.HIGH,
-                description="发现 sudoers 文件中存在 NOPASSWD 免密码完全提权规则，如果该账号被攻陷，攻击者无需口令即可瞬间获取 root 权限！",
+                description="发现 sudoers 文件中存在 NOPASSWD: ALL 免密码完全提权规则，如果该账号被攻陷，攻击者无需口令即可瞬间执行任意命令获取 root 权限！",
                 detail={"dangerous_rules": dangerous_rules},
-                suggestion="评估这些规则的必要性，尽量限制特定执行命令白名单，或移除 NOPASSWD 设置。",
+                suggestion="评估这些规则的必要性，尽量限制特定执行命令白名单，或移除 NOPASSWD: ALL 设置。",
                 raw_evidence="\n".join([f"{d['file']}: {d['rule']}" for d in dangerous_rules])
+            )
+        else:
+            self.add_finding(
+                title="Sudo 免密完全提权审计正常",
+                severity=Severity.INFO,
+                description="未发现 NOPASSWD: ALL 无限制任意命令免密超级提权配置。"
             )
 
     def _check_authorized_keys(self):
         """排查所有用户目录下的 authorized_keys 公钥"""
-        key_files = glob.glob("/root/.ssh/authorized_keys*") + glob.glob("/home/*/.ssh/authorized_keys*")
+        key_files = (
+            glob.glob("/root/.ssh/authorized_keys*") +
+            glob.glob("/home/*/.ssh/authorized_keys*") +
+            glob.glob("/Users/*/.ssh/authorized_keys*") +
+            glob.glob("/var/root/.ssh/authorized_keys*")
+        )
         found_keys = []
 
         for kf in key_files:

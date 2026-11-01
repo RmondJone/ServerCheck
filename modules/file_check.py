@@ -39,43 +39,57 @@ class FileCheck(BaseModule):
                     fpath = os.path.join(root, f)
                     try:
                         st = os.stat(fpath)
-                        # 检查是否有执行权限，或者是以 .sh / .py / .elf / .bin 结尾
+                        # 必须是普通文件，跳过 socket、管道 FIFO、设备文件等
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        # 0 字节文件通常是 lock 或标志文件，不属于恶意可执行载荷
+                        if st.st_size == 0:
+                            continue
+
+                        # 过滤 socket 或 lock 命名特征
+                        lower_f = f.lower()
+                        if lower_f.endswith((".sock", ".lock", ".pid")):
+                            continue
+
+                        # 检查是否有执行权限，或者是以脚本后缀结尾
                         is_exec = bool(st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
                         ext = os.path.splitext(f)[1].lower()
                         is_script = ext in [".sh", ".py", ".pl", ".elf", ".bin", ".so"]
                         
-                        # 检查是否为 ELF 二进制
-                        is_elf = False
-                        if os.path.isfile(fpath) and st.st_size >= 4:
+                        # 检查是否为 ELF 或 Mach-O 原生二进制
+                        is_binary = False
+                        if st.st_size >= 4:
                             try:
                                 with open(fpath, "rb") as bf:
-                                    if bf.read(4) == b"\x7fELF":
-                                        is_elf = True
+                                    magic = bf.read(4)
+                                    # Linux ELF (\x7fELF) 或 macOS Mach-O (\xcf\xfa\xed\xfe / \xca\xfe\xba\xbe 等)
+                                    if magic == b"\x7fELF" or magic in (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"):
+                                        is_binary = True
                             except Exception:
                                 pass
 
-                        if is_exec or is_script or is_elf:
+                        if (is_exec and is_script) or is_binary or (is_exec and not ext):
                             executable_files.append({
                                 "path": fpath,
                                 "size": st.st_size,
-                                "is_elf": is_elf,
+                                "is_binary": is_binary,
                                 "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
                             })
                     except Exception:
                         continue
 
         if executable_files:
-            # 如果有 ELF 二进制，直接提高警报级别为 HIGH
-            has_elf = any(x["is_elf"] for x in executable_files)
-            sev = Severity.HIGH if has_elf else Severity.MEDIUM
+            # 如果有原生二进制，提高警报级别为 HIGH
+            has_bin = any(x["is_binary"] for x in executable_files)
+            sev = Severity.HIGH if has_bin else Severity.MEDIUM
 
             self.add_finding(
                 title=f"临时目录发现可执行文件/脚本 (共 {len(executable_files)} 个)",
                 severity=sev,
-                description=f"在全局可写临时目录 ({', '.join(scan_dirs)}) 中发现了可执行文件或 ELF 二进制！这是黑客投递恶意 Payload 的高发位置！",
+                description=f"在全局可写临时目录 ({', '.join(scan_dirs)}) 中发现了可执行文件或原生二进制！这是黑客投递恶意 Payload 的高发位置！",
                 detail={"files": executable_files},
                 suggestion="检查这些可执行文件是否为合法安装包遗留；若非明确软件请及时隔离并删除对应文件！",
-                raw_evidence="\n".join([f"[{'ELF' if x['is_elf'] else 'SCRIPT'}] {x['path']} ({x['size']} bytes, mtime: {x['mtime']})" for x in executable_files[:20]])
+                raw_evidence="\n".join([f"[{'BINARY' if x['is_binary'] else 'SCRIPT'}] {x['path']} ({x['size']} bytes, mtime: {x['mtime']})" for x in executable_files[:20]])
             )
         else:
             self.add_finding(

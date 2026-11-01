@@ -40,10 +40,17 @@ if [ -z "$PYTHON_BIN" ]; then
     exit 1
 fi
 
-# 2. 检查权限提示
-if [ "$(id -u)" -ne 0 ]; then
+# 2. 检查权限提示与系统环境
+OS_TYPE="$(uname -s)"
+if [ "$OS_TYPE" = "Darwin" ]; then
+    echo -e "${CYAN}[INFO] 检测到运行系统为 macOS，已自动启用跨平台兼容模式。${NC}"
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+    echo -e "${GREEN}[✓] 当前已具备 root / 超级用户权限运行。${NC}\n"
+else
     echo -e "${YELLOW}[!] 当前以普通用户身份运行。${NC}"
-    echo -e "${YELLOW}[!] 强烈建议使用: sudo ./run.sh 或 sudo python3 main.py 以获取完整的安全日志与系统敏感文件检测权限。${NC}\n"
+    echo -e "${YELLOW}[!] 建议使用: sudo ./run.sh 或 sudo python3 main.py 以获取完整的系统安全排查能力。${NC}\n"
 fi
 
 # 3. 执行检测主程序

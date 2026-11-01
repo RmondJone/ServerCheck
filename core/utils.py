@@ -50,6 +50,14 @@ def is_root() -> bool:
         # 非 Unix 系统
         return False
 
+def is_darwin() -> bool:
+    """判断当前系统是否为 macOS (Darwin)"""
+    return platform.system().lower() == "darwin"
+
+def is_linux() -> bool:
+    """判断当前系统是否为 Linux"""
+    return platform.system().lower() == "linux"
+
 def get_os_info() -> Dict[str, str]:
     """获取操作系统基本信息"""
     info = {
@@ -61,8 +69,12 @@ def get_os_info() -> Dict[str, str]:
         "distro": "Unknown",
     }
     
+    # 读取 macOS 版本
+    if info["system"] == "Darwin":
+        mac_ver = platform.mac_ver()[0]
+        info["distro"] = f"macOS {mac_ver}" if mac_ver else "macOS"
     # 读取 Linux 发行版详情
-    if os.path.exists("/etc/os-release"):
+    elif os.path.exists("/etc/os-release"):
         try:
             with open("/etc/os-release", "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:

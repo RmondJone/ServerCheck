@@ -51,11 +51,12 @@ def main():
     reporter.print_banner()
 
     # 检查运行权限
-    if not is_root():
+    if is_root():
+        print(color_text("[✓] 运行权限: 已通过 root / 超级用户权限运行，全量系统审计能力已就绪。\n", Colors.GREEN))
+    else:
         print(color_text("[!] 提示: 当前未以 root / sudo 权限运行。", Colors.YELLOW))
-        print(color_text("    部分涉及安全日志 (/var/log/auth.log, /var/log/secure)、密码影子文件 (/etc/shadow)", Colors.YELLOW))
-        print(color_text("    以及受限进程/网络连接信息的检测项可能会因权限受限而跳过或数据不全。", Colors.YELLOW))
-        print(color_text("    如需获得最全面的排查能力，强烈建议使用: sudo python3 main.py\n", Colors.YELLOW))
+        print(color_text("    部分涉及敏感系统安全日志、特权文件及底层连接信息的检测项可能会受限跳过。", Colors.YELLOW))
+        print(color_text("    如需获得最全面的排查能力，建议使用: sudo python3 main.py\n", Colors.YELLOW))
 
     all_modules = [
         ("bruteforce", BruteForceCheck()),
