@@ -169,4 +169,19 @@ class Reporter:
         with open(md_path, "w", encoding="utf-8") as f:
             f.write("\n".join(md_lines))
 
+        # 若使用 sudo 运行，将生成的文件属主还原为普通用户，并赋予读写权限，避免 IDE 报错
+        self._fix_file_permissions(json_path)
+        self._fix_file_permissions(md_path)
+
         return md_path, json_path
+
+    def _fix_file_permissions(self, filepath: str):
+        """兼容 sudo 执行场景，自动还原文件所有者并开放读写权限"""
+        try:
+            sudo_uid = os.environ.get("SUDO_UID")
+            sudo_gid = os.environ.get("SUDO_GID")
+            if sudo_uid and sudo_gid:
+                os.chown(filepath, int(sudo_uid), int(sudo_gid))
+            os.chmod(filepath, 0o666)
+        except Exception:
+            pass
